@@ -24,6 +24,13 @@
 //! counters and everything else takes the default for its unit. Guessing from
 //! monotonicity would silently mis-bill the first interval of a meter that
 //! happened to rise.
+//!
+//! **What a duplicate sample is, is decided here.** [`dedupe`] is that rule:
+//! one sample per metric per instant, the later one in the given order
+//! winning, and the discard counted against its own metric. [`align`] calls
+//! it, and so does every adapter that reads a feed which can repeat itself
+//! (`eclairos-ingest`'s meter drops, E2.3a). One law, one spelling: an
+//! adapter decides what a *row* is, never what a *duplicate* is.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -122,6 +129,17 @@ struct Series {
     points: Vec<Point>,
 }
 
+/// Samples with the replays removed, and how many each metric lost.
+///
+/// A metric that lost none is absent from the count rather than carrying a
+/// zero: the map answers "what repeated", and a page of zeroes answers
+/// nothing.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Deduped {
+    samples: Vec<Sample>,
+    dupes_by_metric: BTreeMap<MetricName, u32>,
+}
+
 impl Aggregation {
     /// The default for a unit: power is a mean, energy is a sum.
     ///
@@ -173,6 +191,41 @@ impl AlignRules {
         } else {
             Aggregation::for_unit(unit)
         }
+    }
+}
+
+impl Deduped {
+    /// The survivors, in the order they were given.
+    #[must_use]
+    pub fn samples(&self) -> &[Sample] {
+        &self.samples
+    }
+
+    /// The survivors, for a caller that owns them next.
+    #[must_use]
+    pub fn into_samples(self) -> Vec<Sample> {
+        self.samples
+    }
+
+    /// How many samples this metric lost to a repeat. None is zero.
+    #[must_use]
+    pub fn dupes_for(&self, metric: &MetricName) -> u32 {
+        self.dupes_by_metric
+            .get(metric)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// How many samples were discarded across every metric.
+    #[must_use]
+    pub fn dupes(&self) -> u32 {
+        self.dupes_by_metric.values().sum()
+    }
+
+    /// What repeated, metric by metric, in name order.
+    #[must_use]
+    pub const fn dupes_by_metric(&self) -> &BTreeMap<MetricName, u32> {
+        &self.dupes_by_metric
     }
 }
 
@@ -276,18 +329,84 @@ pub fn align(
     interval: Interval15,
     rules: &AlignRules,
 ) -> Result<IntervalReading, AlignError> {
-    let metrics = series_by_metric(samples, interval)?
+    let deduped = dedupe(samples);
+    let metrics = series_by_metric(deduped.samples(), interval)?
         .into_iter()
         .map(|(metric, series)| {
             let aggregation = rules.aggregation_for(&metric, series.unit);
-            reading_of(&metric, &series, aggregation, rules.min_coverage())
+            let dupes = deduped.dupes_for(&metric);
+            reading_of(&metric, &series, aggregation, rules.min_coverage(), dupes)
                 .map(|reading| (metric, reading))
         })
         .collect::<Result<BTreeMap<_, _>, AlignError>>()?;
     Ok(IntervalReading { interval, metrics })
 }
 
-/// The samples of this interval, gathered per metric in the order they came.
+/// One sample per metric per instant, the later one winning.
+///
+/// Two samples of one metric at one instant is a feed that replayed, not a
+/// measurement that happened twice. "Later" is the order the caller gave:
+/// deterministic for a deterministic feed, which is a file's own row order
+/// for a meter drop and arrival order for a poller. Two *different* metrics
+/// at one instant are two measurements and both survive — a site that meters
+/// import and export would otherwise be told half its rows were duplicates.
+///
+/// The survivors keep their order. Nothing is reordered, summed or averaged
+/// here: this calculation only removes repeats and says what it removed.
+#[must_use]
+pub fn dedupe(samples: &[Sample]) -> Deduped {
+    let kept = last_of_each_instant(samples);
+    let dupes_by_metric = discards_by_metric(samples, &kept);
+    let survivors = samples
+        .iter()
+        .enumerate()
+        .filter(|(index, sample)| kept.get(&(sample.metric().clone(), sample.at())) == Some(index))
+        .map(|(_, sample)| sample.clone())
+        .collect();
+    Deduped {
+        samples: survivors,
+        dupes_by_metric,
+    }
+}
+
+/// Where each `(metric, instant)` was last seen.
+fn last_of_each_instant(samples: &[Sample]) -> BTreeMap<(MetricName, UnixSeconds), usize> {
+    samples
+        .iter()
+        .enumerate()
+        .map(|(index, sample)| ((sample.metric().clone(), sample.at()), index))
+        .collect()
+}
+
+/// How many samples each metric lost to a repeat: what it brought, less what
+/// survived. Metrics that lost none are left out.
+fn discards_by_metric(
+    samples: &[Sample],
+    kept: &BTreeMap<(MetricName, UnixSeconds), usize>,
+) -> BTreeMap<MetricName, u32> {
+    let brought = counted_by_metric(samples.iter().map(Sample::metric).cloned());
+    let survived = counted_by_metric(kept.keys().map(|(metric, _)| metric.clone()));
+    brought
+        .into_iter()
+        .filter_map(|(metric, count)| {
+            let lost = count - survived.get(&metric).copied().unwrap_or_default();
+            (lost > 0).then_some((metric, lost))
+        })
+        .collect()
+}
+
+fn counted_by_metric(metrics: impl Iterator<Item = MetricName>) -> BTreeMap<MetricName, u32> {
+    metrics.fold(BTreeMap::new(), |mut counted, metric| {
+        *counted.entry(metric).or_default() += 1;
+        counted
+    })
+}
+
+/// The samples of this interval, gathered per metric and put in time order.
+///
+/// The aggregations below read a series as a sequence in time — a span, a
+/// weighted mean, a rise — so the ordering is this function's to establish
+/// once rather than each of theirs to assume.
 fn series_by_metric(
     samples: &[Sample],
     interval: Interval15,
@@ -322,50 +441,35 @@ fn series_by_metric(
             }
         }
     }
+    for one_metric in series.values_mut() {
+        one_metric.points.sort_by_key(|point| point.at);
+    }
     Ok(series)
 }
 
 /// One metric's verdict: enough coverage and a number, or how little there was.
+///
+/// The duplicates are already gone — [`dedupe`] removed them before the
+/// series was built — and `dupes` is what that calculation reported for this
+/// metric, carried through so a reading says how much of a replay it survived.
 fn reading_of(
     metric: &MetricName,
     series: &Series,
     aggregation: Aggregation,
     min_coverage: Percent,
+    dupes: u32,
 ) -> Result<MetricReading, AlignError> {
-    let (points, dupes) = deduped(&series.points);
-    let coverage = coverage_of(&points, aggregation);
+    let coverage = coverage_of(&series.points, aggregation);
     if coverage == Percent::zero() || coverage < min_coverage {
         return Ok(MetricReading::Missing { coverage });
     }
-    let value = aggregate(metric, &points, aggregation)?;
+    let value = aggregate(metric, &series.points, aggregation)?;
     Ok(MetricReading::Present(Reading {
         value,
         unit: series.unit,
         coverage,
         dupes,
     }))
-}
-
-/// One point per instant, the later one winning, and how many were discarded.
-///
-/// Two samples of one metric at one instant is a feed that replayed, not a
-/// measurement that happened twice. The sort is stable, so "later" is the
-/// feed's own order for samples that share an instant.
-fn deduped(points: &[Point]) -> (Vec<Point>, u32) {
-    let mut ordered = points.to_vec();
-    ordered.sort_by_key(|point| point.at);
-    let mut kept: Vec<Point> = Vec::with_capacity(ordered.len());
-    let mut dupes = 0;
-    for point in ordered {
-        match kept.last_mut() {
-            Some(previous) if previous.at == point.at => {
-                *previous = point;
-                dupes += 1;
-            }
-            _ => kept.push(point),
-        }
-    }
-    (kept, dupes)
 }
 
 /// How much of the interval these points measured.
@@ -484,6 +588,95 @@ mod tests {
     #[test]
     fn an_interval_is_nine_hundred_seconds() {
         assert!((interval_seconds() - 900.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn dedupe_keeps_the_later_sample_of_a_repeated_instant() {
+        let samples = [
+            at_minute("hall.kw", 5, 999.0, Unit::Kilowatts),
+            at_minute("hall.kw", 5, 200.0, Unit::Kilowatts),
+        ];
+
+        let deduped = dedupe(&samples);
+
+        assert_eq!(deduped.samples().len(), 1);
+        assert!((deduped.samples()[0].value() - 200.0).abs() < f64::EPSILON);
+        assert_eq!(deduped.dupes(), 1);
+        assert_eq!(deduped.dupes_for(&metric("hall.kw")), 1);
+    }
+
+    /// The rule is keyed by instant, not by adjacency: a replay that arrives
+    /// after an intervening sample is the same replay.
+    #[test]
+    fn dedupe_collapses_a_repeat_that_is_not_adjacent() {
+        let samples = [
+            at_minute("hall.kw", 5, 999.0, Unit::Kilowatts),
+            at_minute("hall.kw", 9, 150.0, Unit::Kilowatts),
+            at_minute("hall.kw", 5, 200.0, Unit::Kilowatts),
+        ];
+
+        let deduped = dedupe(&samples);
+
+        let values: Vec<f64> = deduped.samples().iter().map(Sample::value).collect();
+        assert_eq!(values.len(), 2);
+        assert!((values[0] - 150.0).abs() < f64::EPSILON, "{values:?}");
+        assert!((values[1] - 200.0).abs() < f64::EPSILON, "{values:?}");
+        assert_eq!(deduped.dupes(), 1);
+    }
+
+    /// A site that meters both directions reports two metrics at one instant.
+    /// Neither is a duplicate of the other.
+    #[test]
+    fn dedupe_keeps_two_metrics_that_share_an_instant() {
+        let samples = [
+            at_minute("meter.main.import_kw", 0, 1300.0, Unit::Kilowatts),
+            at_minute("meter.main.export_kw", 0, 40.0, Unit::Kilowatts),
+        ];
+
+        let deduped = dedupe(&samples);
+
+        assert_eq!(deduped.samples().len(), 2);
+        assert_eq!(deduped.dupes(), 0);
+        assert!(deduped.dupes_by_metric().is_empty());
+    }
+
+    #[test]
+    fn dedupe_counts_each_metrics_repeats_against_itself() {
+        let samples = [
+            at_minute("hall.kw", 0, 1.0, Unit::Kilowatts),
+            at_minute("hall.kw", 0, 2.0, Unit::Kilowatts),
+            at_minute("hall.kw", 0, 3.0, Unit::Kilowatts),
+            at_minute("cooling.kw", 0, 4.0, Unit::Kilowatts),
+            at_minute("cooling.kw", 0, 5.0, Unit::Kilowatts),
+        ];
+
+        let deduped = dedupe(&samples);
+
+        assert_eq!(deduped.dupes_for(&metric("hall.kw")), 2);
+        assert_eq!(deduped.dupes_for(&metric("cooling.kw")), 1);
+        assert_eq!(deduped.dupes(), 3);
+    }
+
+    #[test]
+    fn dedupe_of_nothing_is_nothing() {
+        let deduped = dedupe(&[]);
+
+        assert_eq!(deduped, Deduped::default());
+        assert_eq!(deduped.dupes(), 0);
+        assert!(deduped.into_samples().is_empty());
+    }
+
+    #[test]
+    fn dedupe_leaves_samples_that_do_not_repeat_alone() {
+        let samples = [
+            at_minute("hall.kw", 0, 100.0, Unit::Kilowatts),
+            at_minute("hall.kw", 5, 200.0, Unit::Kilowatts),
+        ];
+
+        let deduped = dedupe(&samples);
+
+        assert_eq!(deduped.samples(), samples);
+        assert_eq!(deduped.dupes(), 0);
     }
 
     /// The issue's hand example: 100 kW held for five minutes, then 200 kW
