@@ -13,4 +13,4 @@ keywords = ["interval", "timeseries", "alignment", "coverage", "metrics"]
 categories = ["science", "date-and-time"]
 
 [dependencies]
-thiserror = "1"
+thiserror = "2"
