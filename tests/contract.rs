@@ -1,5 +1,7 @@
-//! Consumer contract: alignment types and golden numbers must not drift.
-//! All timestamps and values are synthetic.
+//! Consumer contract: the specified alignment names and golden numbers
+//! must not drift. Extra public items, variants, and fields may appear;
+//! these tests only bind what the contract names. All timestamps and values
+//! are synthetic.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -21,14 +23,6 @@ const AUTUMN_START: Timestamp = 29_891_820 * 60;
 
 fn timestamp_as_i64(at: Timestamp) -> i64 {
     at
-}
-
-fn kind_name(kind: Kind) -> &'static str {
-    match kind {
-        Kind::Power => "Power",
-        Kind::Energy => "Energy",
-        Kind::Counter => "Counter",
-    }
 }
 
 fn default_length() -> Duration {
@@ -73,6 +67,29 @@ fn assert_strictly_stepping(starts: &[Timestamp], step: i64) {
         assert_eq!(pair[1] - pair[0], step);
         assert!(pair[1] > pair[0]);
     }
+}
+
+/// Bind the specified `Value` fields. Extra fields and extra `Reading`
+/// variants are ignored so the module can grow.
+fn expect_value(reading: &Reading) -> (f64, u8, u32) {
+    let Reading::Value {
+        value,
+        coverage_pct,
+        duplicates,
+        ..
+    } = reading
+    else {
+        panic!("expected Value, got {reading:?}");
+    };
+    (*value, *coverage_pct, *duplicates)
+}
+
+/// Bind `Missing.coverage_pct` only. A value must not be readable here.
+fn expect_missing(reading: &Reading) -> u8 {
+    let Reading::Missing { coverage_pct, .. } = reading else {
+        panic!("expected Missing with no value, got {reading:?}");
+    };
+    *coverage_pct
 }
 
 fn dependency_crate_names(cargo_toml: &str) -> Vec<&str> {
@@ -128,10 +145,10 @@ fn src_contains_forbidden(text: &str) -> Option<&'static str> {
 }
 
 #[test]
-fn kinds_are_power_energy_and_counter() {
-    assert_eq!(kind_name(Kind::Power), "Power");
-    assert_eq!(kind_name(Kind::Energy), "Energy");
-    assert_eq!(kind_name(Kind::Counter), "Counter");
+fn specified_kinds_include_power_energy_and_counter() {
+    let _power = Kind::Power;
+    let _energy = Kind::Energy;
+    let _counter = Kind::Counter;
 }
 
 #[test]
@@ -152,23 +169,14 @@ fn power_hand_example_is_the_time_weighted_mean() {
     let aligned: BTreeMap<String, Reading> =
         align(&samples, default_interval(), &default_rules()).expect("three samples align");
 
-    match aligned.get("hall.kw").expect("hall.kw was sampled") {
-        Reading::Value {
-            value,
-            coverage_pct,
-            duplicates,
-        } => {
-            assert!(
-                (value - 158.333_333_333_333_33).abs() < 1e-9,
-                "mean was {value}"
-            );
-            assert_eq!(*coverage_pct, 80);
-            assert_eq!(*duplicates, 0);
-        }
-        Reading::Missing { coverage_pct } => {
-            panic!("expected Value, got Missing {{ coverage_pct: {coverage_pct} }}")
-        }
-    }
+    let (value, coverage_pct, duplicates) =
+        expect_value(aligned.get("hall.kw").expect("hall.kw was sampled"));
+    assert!(
+        (value - 158.333_333_333_333_33).abs() < 1e-9,
+        "mean was {value}"
+    );
+    assert_eq!(coverage_pct, 80);
+    assert_eq!(duplicates, 0);
 }
 
 #[test]
@@ -182,16 +190,10 @@ fn thin_power_is_missing_with_no_value_field() {
     let aligned: BTreeMap<String, Reading> =
         align(&samples, default_interval(), &default_rules()).expect("three samples align");
 
-    match aligned.get("hall.kw").expect("hall.kw was sampled") {
-        Reading::Missing { coverage_pct } => assert_eq!(*coverage_pct, 40),
-        Reading::Value {
-            value,
-            coverage_pct,
-            duplicates,
-        } => panic!(
-            "expected Missing with no value, got Value {{ value: {value}, coverage_pct: {coverage_pct}, duplicates: {duplicates} }}"
-        ),
-    }
+    assert_eq!(
+        expect_missing(aligned.get("hall.kw").expect("hall.kw was sampled")),
+        40
+    );
 }
 
 #[test]
@@ -206,23 +208,14 @@ fn replay_before_the_kept_sample_counts_as_one_duplicate() {
     let aligned: BTreeMap<String, Reading> =
         align(&samples, default_interval(), &default_rules()).expect("four samples align");
 
-    match aligned.get("hall.kw").expect("hall.kw was sampled") {
-        Reading::Value {
-            value,
-            coverage_pct,
-            duplicates,
-        } => {
-            assert!(
-                (value - 158.333_333_333_333_33).abs() < 1e-9,
-                "the replayed 999 survived: {value}"
-            );
-            assert_eq!(*coverage_pct, 80);
-            assert_eq!(*duplicates, 1);
-        }
-        Reading::Missing { coverage_pct } => {
-            panic!("expected Value, got Missing {{ coverage_pct: {coverage_pct} }}")
-        }
-    }
+    let (value, coverage_pct, duplicates) =
+        expect_value(aligned.get("hall.kw").expect("hall.kw was sampled"));
+    assert!(
+        (value - 158.333_333_333_333_33).abs() < 1e-9,
+        "the replayed 999 survived: {value}"
+    );
+    assert_eq!(coverage_pct, 80);
+    assert_eq!(duplicates, 1);
 }
 
 #[test]
@@ -248,16 +241,10 @@ fn one_power_sample_is_missing_even_at_zero_minimum() {
     let aligned: BTreeMap<String, Reading> =
         align(&samples, default_interval(), &rules).expect("one sample aligns");
 
-    match aligned.get("hall.kw").expect("hall.kw was sampled") {
-        Reading::Missing { coverage_pct } => assert_eq!(*coverage_pct, 0),
-        Reading::Value {
-            value,
-            coverage_pct,
-            duplicates,
-        } => panic!(
-            "expected Missing with no value, got Value {{ value: {value}, coverage_pct: {coverage_pct}, duplicates: {duplicates} }}"
-        ),
-    }
+    assert_eq!(
+        expect_missing(aligned.get("hall.kw").expect("hall.kw was sampled")),
+        0
+    );
 }
 
 #[test]
@@ -267,19 +254,10 @@ fn one_energy_sample_is_the_value_itself() {
     let aligned: BTreeMap<String, Reading> =
         align(&samples, default_interval(), &default_rules()).expect("one row aligns");
 
-    match aligned.get("meter.kwh").expect("meter.kwh was sampled") {
-        Reading::Value {
-            value,
-            coverage_pct,
-            duplicates: _,
-        } => {
-            assert_eq!(*value, 42.0);
-            assert_eq!(*coverage_pct, 100);
-        }
-        Reading::Missing { coverage_pct } => {
-            panic!("expected Value, got Missing {{ coverage_pct: {coverage_pct} }}")
-        }
-    }
+    let (value, coverage_pct, _) =
+        expect_value(aligned.get("meter.kwh").expect("meter.kwh was sampled"));
+    assert_eq!(value, 42.0);
+    assert_eq!(coverage_pct, 100);
 }
 
 #[test]
@@ -295,16 +273,8 @@ fn counter_rise_is_the_difference() {
     let aligned: BTreeMap<String, Reading> =
         align(&samples, default_interval(), &rules).expect("a counter aligns");
 
-    match aligned.get("meter.total").expect("meter.total was sampled") {
-        Reading::Value {
-            value,
-            coverage_pct: _,
-            duplicates: _,
-        } => assert_eq!(*value, 364.0),
-        Reading::Missing { coverage_pct } => {
-            panic!("expected Value, got Missing {{ coverage_pct: {coverage_pct} }}")
-        }
-    }
+    let (value, _, _) = expect_value(aligned.get("meter.total").expect("meter.total was sampled"));
+    assert_eq!(value, 364.0);
 }
 
 #[test]
@@ -315,13 +285,10 @@ fn falling_counter_is_counter_went_backwards() {
     ];
 
     let refused = align(&samples, default_interval(), &default_rules());
-
-    assert_eq!(
-        refused,
-        Err(AlignError::CounterWentBackwards {
-            metric: "meter.total".to_owned()
-        })
-    );
+    let Err(AlignError::CounterWentBackwards { metric, .. }) = refused else {
+        panic!("expected CounterWentBackwards, got {refused:?}");
+    };
+    assert_eq!(metric, "meter.total");
 }
 
 #[test]
@@ -329,14 +296,11 @@ fn sample_at_interval_end_is_outside() {
     let samples = [sample("hall.kw", START + 900, 100.0, Kind::Power)];
 
     let refused = align(&samples, default_interval(), &default_rules());
-
-    assert_eq!(
-        refused,
-        Err(AlignError::SampleOutsideInterval {
-            metric: "hall.kw".to_owned(),
-            at: START + 900,
-        })
-    );
+    let Err(AlignError::SampleOutsideInterval { metric, at, .. }) = refused else {
+        panic!("expected SampleOutsideInterval, got {refused:?}");
+    };
+    assert_eq!(metric, "hall.kw");
+    assert_eq!(at, START + 900);
 }
 
 #[test]
